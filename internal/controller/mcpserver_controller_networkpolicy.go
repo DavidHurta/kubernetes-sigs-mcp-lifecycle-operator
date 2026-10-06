@@ -20,6 +20,8 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"net"
+	"slices"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -51,7 +53,12 @@ func (r *MCPServerReconciler) ensureNetworkPolicy(
 ) (*networkingv1.NetworkPolicy, error) {
 	logger := log.FromContext(ctx)
 
-	netpol := r.createNetworkPolicy(mcpServer)
+	gatewayPeers, gwErr := r.gatewayIngressPeers(ctx, mcpServer)
+	if gwErr != nil {
+		logger.Error(gwErr, "Failed to resolve gateway ingress peers")
+		return nil, gwErr
+	}
+	netpol := r.createNetworkPolicy(mcpServer, gatewayPeers)
 	if err := controllerutil.SetControllerReference(mcpServer, netpol, r.Scheme); err != nil {
 		logger.Error(err, "Failed to set controller reference for NetworkPolicy")
 		return nil, err
@@ -68,7 +75,7 @@ func (r *MCPServerReconciler) ensureNetworkPolicy(
 			logger.Error(err, "Failed to create NetworkPolicy")
 			return nil, err
 		}
-		if mcpServer.Spec.Network == nil || len(mcpServer.Spec.Network.IngressFrom) == 0 {
+		if !hasIngressSourceRestriction(netpol) {
 			logger.Info("NetworkPolicy created without ingress source restrictions", keyName, netpol.Name)
 		}
 		if mcpServer.Spec.Network == nil || (len(mcpServer.Spec.Network.EgressTo) == 0 && len(mcpServer.Spec.Network.EgressPorts) == 0) {
@@ -127,22 +134,18 @@ func (r *MCPServerReconciler) ensureNetworkPolicy(
 	return netpol, nil
 }
 
-func (r *MCPServerReconciler) createNetworkPolicy(mcpServer *mcpv1beta1.MCPServer) *networkingv1.NetworkPolicy {
+// createNetworkPolicy builds the desired operand NetworkPolicy. It is pure (no
+// API access): the caller resolves any gateway ingress peer beforehand and
+// passes it in, so the posture-reporting path can rebuild the policy without a
+// client. gatewayPeers is nil unless the server is gateway-routed under the
+// restricted posture.
+func (r *MCPServerReconciler) createNetworkPolicy(
+	mcpServer *mcpv1beta1.MCPServer,
+	gatewayPeers []networkingv1.NetworkPolicyPeer,
+) *networkingv1.NetworkPolicy {
 	labels := managedWorkloadLabels(mcpServer.Name)
-	port := intstr.FromInt32(mcpServer.Spec.Config.Port)
-	protocol := corev1.ProtocolTCP
 
-	ingressRule := networkingv1.NetworkPolicyIngressRule{
-		Ports: []networkingv1.NetworkPolicyPort{
-			{
-				Port:     &port,
-				Protocol: &protocol,
-			},
-		},
-	}
-	if mcpServer.Spec.Network != nil && len(mcpServer.Spec.Network.IngressFrom) > 0 {
-		ingressRule.From = mcpServer.Spec.Network.DeepCopy().IngressFrom
-	}
+	ingressRules := defaultIngressRules(mcpServer, r.NetworkPolicyDefaultPosture, gatewayPeers)
 
 	egressRules := buildEgressRules(mcpServer)
 
@@ -160,10 +163,8 @@ func (r *MCPServerReconciler) createNetworkPolicy(mcpServer *mcpv1beta1.MCPServe
 				networkingv1.PolicyTypeIngress,
 				networkingv1.PolicyTypeEgress,
 			},
-			Ingress: []networkingv1.NetworkPolicyIngressRule{
-				ingressRule,
-			},
-			Egress: egressRules,
+			Ingress: ingressRules,
+			Egress:  egressRules,
 		},
 	}
 }
@@ -173,6 +174,15 @@ func buildEgressRules(mcpServer *mcpv1beta1.MCPServer) []networkingv1.NetworkPol
 	hasEgressPorts := mcpServer.Spec.Network != nil && len(mcpServer.Spec.Network.EgressPorts) > 0
 
 	if !hasEgressTo && !hasEgressPorts {
+		// Default egress is allow-all: a single empty rule permits unrestricted
+		// outbound traffic to any destination on any port. This is intentional -
+		// MCP servers commonly reach arbitrary external endpoints (the APIs they
+		// front), and standard NetworkPolicy cannot select DNS names or reliably
+		// represent dynamically addressed destinations, so a narrower default
+		// would break legitimate traffic. Callers that need to restrict egress
+		// set Spec.Network.EgressTo/EgressPorts, or govern it with a separate
+		// network control (an allow-all rule is additive and cannot be narrowed
+		// by another NetworkPolicy).
 		return []networkingv1.NetworkPolicyEgressRule{{}}
 	}
 
@@ -206,13 +216,18 @@ func buildEgressRules(mcpServer *mcpv1beta1.MCPServer) []networkingv1.NetworkPol
 // the posture from the desired policy built by createNetworkPolicy, using the
 // same restriction-detection helpers as the audit signal so the two never
 // disagree. The condition is informational and never gates readiness.
+//
+// This path builds the policy without a gateway ingress peer (nil): both the
+// deny-by-default rule set and a gateway-scoped rule set report as ingress
+// restricted, so the posture verdict is unaffected. The success path reports
+// from the actually-applied policy via networkPolicyPostureConditionFor.
 func (r *MCPServerReconciler) networkPolicyPostureCondition(
 	mcpServer *mcpv1beta1.MCPServer,
 	generation int64,
 	existingConditions []metav1.Condition,
 ) metav1.Condition {
 	return r.networkPolicyPostureConditionFor(
-		mcpServer, generation, existingConditions, r.createNetworkPolicy(mcpServer))
+		mcpServer, generation, existingConditions, r.createNetworkPolicy(mcpServer, nil))
 }
 
 // networkPolicyPostureConditionFor derives the posture condition from an
@@ -265,14 +280,74 @@ func (r *MCPServerReconciler) networkPolicyPostureConditionFor(
 }
 
 func hasIngressSourceRestriction(netpol *networkingv1.NetworkPolicy) bool {
+	// An empty ingress rule set with Ingress declared in policyTypes denies all
+	// ingress - the most restrictive posture - so it counts as restricted. Without
+	// this the deny-by-default policy would be misreported as source-unrestricted.
+	if len(netpol.Spec.Ingress) == 0 && slices.Contains(netpol.Spec.PolicyTypes, networkingv1.PolicyTypeIngress) {
+		return true
+	}
 	for _, rule := range netpol.Spec.Ingress {
-		for _, peer := range rule.From {
-			if peer.PodSelector != nil || peer.NamespaceSelector != nil || peer.IPBlock != nil {
-				return true
-			}
+		// A rule restricts ingress only when it constrains both the source and the
+		// destination port. A rule that names a source but leaves ports empty still
+		// admits that source on every port, so it is not a genuine restriction.
+		if len(rule.Ports) == 0 {
+			continue
+		}
+		// Peers within a rule are OR'ed, so the rule restricts sources only when it
+		// names at least one peer and every peer narrows the source set. A single
+		// admit-all peer (e.g. 0.0.0.0/0 listed alongside a podSelector) opens the
+		// rule to every source, so it must not be reported as restricted.
+		if len(rule.From) > 0 && !slices.ContainsFunc(rule.From, peerAdmitsAllSources) {
+			return true
 		}
 	}
 	return false
+}
+
+// peerRestrictsSource reports whether an ingress peer actually narrows the set of
+// allowed sources. Patterns that match every source - an empty namespaceSelector
+// (all namespaces), or a universal CIDR with no exceptions - do not count, so
+// they are not misreported as a restriction.
+func peerRestrictsSource(peer networkingv1.NetworkPolicyPeer) bool {
+	if peer.IPBlock != nil {
+		return len(peer.IPBlock.Except) > 0 || !isUniversalCIDR(peer.IPBlock.CIDR)
+	}
+	// A podSelector with match criteria narrows sources regardless of namespace.
+	if peer.PodSelector != nil && !isEmptyLabelSelector(peer.PodSelector) {
+		return true
+	}
+	// A namespaceSelector narrows sources only when it selects a subset of
+	// namespaces; an empty selector matches all namespaces.
+	if peer.NamespaceSelector != nil && !isEmptyLabelSelector(peer.NamespaceSelector) {
+		return true
+	}
+	// An empty podSelector with no namespaceSelector restricts to the policy's own
+	// namespace, which is a genuine (if broad) restriction.
+	return peer.PodSelector != nil && peer.NamespaceSelector == nil
+}
+
+// peerAdmitsAllSources reports whether an ingress peer admits every source. It is
+// the inverse of peerRestrictsSource and is used to detect an admit-all peer OR'ed
+// into an otherwise restrictive rule, which opens the rule to all sources.
+func peerAdmitsAllSources(peer networkingv1.NetworkPolicyPeer) bool {
+	return !peerRestrictsSource(peer)
+}
+
+func isEmptyLabelSelector(selector *metav1.LabelSelector) bool {
+	return selector != nil && len(selector.MatchLabels) == 0 && len(selector.MatchExpressions) == 0
+}
+
+// isUniversalCIDR reports whether cidr covers every address, i.e. it has a prefix
+// length of zero. Detecting universality by mask size rather than by matching the
+// canonical literals "0.0.0.0/0" / "::/0" also catches non-canonical spellings
+// such as "10.0.0.0/0" or "0::/0". Invalid input is not universal.
+func isUniversalCIDR(cidr string) bool {
+	_, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return false
+	}
+	ones, _ := ipNet.Mask.Size()
+	return ones == 0
 }
 
 func hasEgressDestinationRestriction(netpol *networkingv1.NetworkPolicy) bool {
