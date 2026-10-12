@@ -1,4 +1,4 @@
-//go:build e2e
+//go:build e2e && openshift
 
 /*
 Copyright 2026 The Kubernetes Authors
