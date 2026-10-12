@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
 	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
@@ -43,13 +44,96 @@ const (
 	mcpGatewayCatalog    = "redhat-operators"
 	mcpGatewayMarketplNs = "openshift-marketplace"
 
-	openshiftGatewayClass = "openshift-default"
+	ossmOLMPackage = "servicemeshoperator3"
+	ossmChannel    = "stable"
+	ossmNamespace  = "openshift-operators"
+
+	istioNamespace    = "istio-system"
+	istioCNINamespace = "istio-cni"
+
+	openshiftGatewayClass = "istio"
+	openshiftPublicHost   = "mcp.e2e.test"
 )
 
 type mcpGatewayOLMLifecycle struct{}
 
 func (l *mcpGatewayOLMLifecycle) Setup(ctx context.Context, cfg *envconf.Config) error {
 	r := cfg.Client().Resources()
+
+	// --- OSSM3 (Istio) ---
+
+	// Install OSSM3 operator (provides Istio GatewayClass and EnvoyFilter CRD).
+	ossmSub := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "operators.coreos.com/v1alpha1",
+		"kind":       "Subscription",
+		"metadata": map[string]any{
+			"name":      ossmOLMPackage,
+			"namespace": ossmNamespace,
+		},
+		"spec": map[string]any{
+			"channel":             ossmChannel,
+			"name":                ossmOLMPackage,
+			"source":              mcpGatewayCatalog,
+			"sourceNamespace":     mcpGatewayMarketplNs,
+			"installPlanApproval": "Automatic",
+		},
+	}}
+	if err := r.Create(ctx, ossmSub); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create OSSM Subscription: %w", err)
+	}
+
+	if err := waitForCSVSucceeded(ctx, r, ossmOLMPackage, ossmNamespace, 5*time.Minute); err != nil {
+		return fmt.Errorf("wait for OSSM CSV: %w", err)
+	}
+
+	// Create IstioCNI.
+	istioCNINs := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: istioCNINamespace}}
+	if err := r.Create(ctx, istioCNINs); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create namespace %s: %w", istioCNINamespace, err)
+	}
+
+	istioCNI := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "sailoperator.io/v1",
+		"kind":       "IstioCNI",
+		"metadata": map[string]any{
+			"name": "default",
+		},
+		"spec": map[string]any{
+			"version":   "v1.30-latest",
+			"namespace": istioCNINamespace,
+		},
+	}}
+	if err := r.Create(ctx, istioCNI); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create IstioCNI: %w", err)
+	}
+
+	// Create Istio control plane.
+	istioNs := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: istioNamespace}}
+	if err := r.Create(ctx, istioNs); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create namespace %s: %w", istioNamespace, err)
+	}
+
+	istio := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "sailoperator.io/v1",
+		"kind":       "Istio",
+		"metadata": map[string]any{
+			"name": "default",
+		},
+		"spec": map[string]any{
+			"version":   "v1.30-latest",
+			"namespace": istioNamespace,
+		},
+	}}
+	if err := r.Create(ctx, istio); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create Istio: %w", err)
+	}
+
+	// Wait for the istio GatewayClass to appear.
+	if err := waitForGatewayClass(ctx, r, openshiftGatewayClass, 5*time.Minute); err != nil {
+		return fmt.Errorf("wait for GatewayClass %s: %w", openshiftGatewayClass, err)
+	}
+
+	// --- mcp-gateway operator ---
 
 	// Create mcp-system namespace for the OLM-managed operator.
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: mcpSystemNamespace}}
@@ -104,13 +188,15 @@ func (l *mcpGatewayOLMLifecycle) Setup(ctx context.Context, cfg *envconf.Config)
 		return fmt.Errorf("wait for CSV: %w", err)
 	}
 
+	// --- Gateway infrastructure ---
+
 	// Create gateway-system namespace.
 	gwNs := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: gatewayNamespace}}
 	if err := r.Create(ctx, gwNs); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create namespace %s: %w", gatewayNamespace, err)
 	}
 
-	// Create Gateway with dual listeners using openshift-default class.
+	// Create Gateway with dual listeners.
 	fromAll := gatewayv1.NamespacesFromAll
 	wildcardHost := gatewayv1.Hostname("*.mcp.e2e.test")
 	gw := &gatewayv1.Gateway{
@@ -161,6 +247,7 @@ func (l *mcpGatewayOLMLifecycle) Setup(ctx context.Context, cfg *envconf.Config)
 			Namespace: mcpSystemNamespace,
 		},
 		Spec: kuadrantapi.MCPGatewayExtensionSpec{
+			PublicHost: openshiftPublicHost,
 			TargetRef: kuadrantapi.TargetReference{
 				Group:       gatewayv1.GroupName,
 				Kind:        "Gateway",
@@ -174,26 +261,31 @@ func (l *mcpGatewayOLMLifecycle) Setup(ctx context.Context, cfg *envconf.Config)
 		return fmt.Errorf("create MCPGatewayExtension: %w", err)
 	}
 
+	// Register v1beta1 types — OpenShift serves ReferenceGrant only as v1beta1.
+	if err := gatewayv1beta1.Install(r.GetScheme()); err != nil {
+		return fmt.Errorf("register Gateway API v1beta1 types: %w", err)
+	}
+
 	// Create ReferenceGrant allowing mcp-system to reference gateway-system resources.
-	grant := &gatewayv1.ReferenceGrant{
+	grant := &gatewayv1beta1.ReferenceGrant{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      referenceGrantName,
 			Namespace: gatewayNamespace,
 		},
-		Spec: gatewayv1.ReferenceGrantSpec{
-			From: []gatewayv1.ReferenceGrantFrom{
+		Spec: gatewayv1beta1.ReferenceGrantSpec{
+			From: []gatewayv1beta1.ReferenceGrantFrom{
 				{
 					Group:     "gateway.networking.k8s.io",
 					Kind:      "HTTPRoute",
-					Namespace: gatewayv1.Namespace(mcpSystemNamespace),
+					Namespace: gatewayv1beta1.Namespace(mcpSystemNamespace),
 				},
 				{
 					Group:     "mcp.kuadrant.io",
 					Kind:      "MCPGatewayExtension",
-					Namespace: gatewayv1.Namespace(mcpSystemNamespace),
+					Namespace: gatewayv1beta1.Namespace(mcpSystemNamespace),
 				},
 			},
-			To: []gatewayv1.ReferenceGrantTo{
+			To: []gatewayv1beta1.ReferenceGrantTo{
 				{Group: "", Kind: "Service"},
 				{Group: "gateway.networking.k8s.io", Kind: "Gateway"},
 			},
@@ -222,7 +314,7 @@ func (l *mcpGatewayOLMLifecycle) Teardown(ctx context.Context, cfg *envconf.Conf
 			return apierrors.IsNotFound(err), nil
 		})
 
-	grant := &gatewayv1.ReferenceGrant{
+	grant := &gatewayv1beta1.ReferenceGrant{
 		ObjectMeta: metav1.ObjectMeta{Name: referenceGrantName, Namespace: gatewayNamespace},
 	}
 	_ = r.Delete(ctx, grant)
@@ -232,7 +324,7 @@ func (l *mcpGatewayOLMLifecycle) Teardown(ctx context.Context, cfg *envconf.Conf
 	}
 	_ = r.Delete(ctx, gw)
 
-	// Delete OLM resources.
+	// Delete mcp-gateway OLM resources.
 	sub := &unstructured.Unstructured{}
 	sub.SetGroupVersionKind(schema.GroupVersionKind{
 		Group: "operators.coreos.com", Version: "v1alpha1", Kind: "Subscription",
@@ -259,7 +351,41 @@ func (l *mcpGatewayOLMLifecycle) Teardown(ctx context.Context, cfg *envconf.Conf
 	og.SetNamespace(mcpSystemNamespace)
 	_ = r.Delete(ctx, og)
 
-	for _, ns := range []string{mcpSystemNamespace, gatewayNamespace} {
+	// Delete Istio control plane and CNI.
+	istio := &unstructured.Unstructured{}
+	istio.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "sailoperator.io", Version: "v1", Kind: "Istio",
+	})
+	istio.SetName("default")
+	_ = r.Delete(ctx, istio)
+
+	istioCNI := &unstructured.Unstructured{}
+	istioCNI.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "sailoperator.io", Version: "v1", Kind: "IstioCNI",
+	})
+	istioCNI.SetName("default")
+	_ = r.Delete(ctx, istioCNI)
+
+	// Delete OSSM operator subscription.
+	ossmSub := &unstructured.Unstructured{}
+	ossmSub.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "operators.coreos.com", Version: "v1alpha1", Kind: "Subscription",
+	})
+	ossmSub.SetName(ossmOLMPackage)
+	ossmSub.SetNamespace(ossmNamespace)
+	_ = r.Delete(ctx, ossmSub)
+
+	ossmCSVList := &unstructured.UnstructuredList{}
+	ossmCSVList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "operators.coreos.com", Version: "v1alpha1", Kind: "ClusterServiceVersionList",
+	})
+	if err := r.WithNamespace(ossmNamespace).List(ctx, ossmCSVList); err == nil {
+		for i := range ossmCSVList.Items {
+			_ = r.Delete(ctx, &ossmCSVList.Items[i])
+		}
+	}
+
+	for _, ns := range []string{mcpSystemNamespace, gatewayNamespace, istioNamespace, istioCNINamespace} {
 		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
 		_ = r.Delete(ctx, nsObj)
 	}
@@ -291,6 +417,22 @@ func waitForCSVSucceeded(ctx context.Context, r *resources.Resources, subName, n
 			}
 			phase, _, _ := unstructured.NestedString(csv.Object, "status", "phase")
 			return phase == "Succeeded", nil
+		})
+}
+
+func waitForGatewayClass(ctx context.Context, r *resources.Resources, name string, timeout time.Duration) error {
+	return wait.PollUntilContextTimeout(ctx, 5*time.Second, timeout, true,
+		func(ctx context.Context) (bool, error) {
+			gc := &gatewayv1.GatewayClass{}
+			if err := r.Get(ctx, name, "", gc); err != nil {
+				return false, nil
+			}
+			for _, c := range gc.Status.Conditions {
+				if c.Type == "Accepted" && c.Status == metav1.ConditionTrue {
+					return true, nil
+				}
+			}
+			return false, nil
 		})
 }
 
