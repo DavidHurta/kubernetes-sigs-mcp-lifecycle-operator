@@ -100,7 +100,7 @@ func (l *mcpGatewayOLMLifecycle) Setup(ctx context.Context, cfg *envconf.Config)
 	}
 
 	// Wait for the CSV to reach Succeeded.
-	if err := waitForCSVSucceeded(ctx, r, mcpSystemNamespace, 5*time.Minute); err != nil {
+	if err := waitForCSVSucceeded(ctx, r, mcpGatewayOLMPackage, mcpSystemNamespace, 5*time.Minute); err != nil {
 		return fmt.Errorf("wait for CSV: %w", err)
 	}
 
@@ -267,23 +267,30 @@ func (l *mcpGatewayOLMLifecycle) Teardown(ctx context.Context, cfg *envconf.Conf
 	return nil
 }
 
-func waitForCSVSucceeded(ctx context.Context, r *resources.Resources, ns string, timeout time.Duration) error {
+func waitForCSVSucceeded(ctx context.Context, r *resources.Resources, subName, ns string, timeout time.Duration) error {
 	return wait.PollUntilContextTimeout(ctx, 5*time.Second, timeout, true,
 		func(ctx context.Context) (bool, error) {
-			csvList := &unstructured.UnstructuredList{}
-			csvList.SetGroupVersionKind(schema.GroupVersionKind{
-				Group: "operators.coreos.com", Version: "v1alpha1", Kind: "ClusterServiceVersionList",
+			sub := &unstructured.Unstructured{}
+			sub.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "operators.coreos.com", Version: "v1alpha1", Kind: "Subscription",
 			})
-			if err := r.WithNamespace(ns).List(ctx, csvList); err != nil {
+			if err := r.Get(ctx, subName, ns, sub); err != nil {
 				return false, nil
 			}
-			for _, csv := range csvList.Items {
-				phase, _, _ := unstructured.NestedString(csv.Object, "status", "phase")
-				if phase == "Succeeded" {
-					return true, nil
-				}
+			csvName, _, _ := unstructured.NestedString(sub.Object, "status", "installedCSV")
+			if csvName == "" {
+				return false, nil
 			}
-			return false, nil
+
+			csv := &unstructured.Unstructured{}
+			csv.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "operators.coreos.com", Version: "v1alpha1", Kind: "ClusterServiceVersion",
+			})
+			if err := r.Get(ctx, csvName, ns, csv); err != nil {
+				return false, nil
+			}
+			phase, _, _ := unstructured.NestedString(csv.Object, "status", "phase")
+			return phase == "Succeeded", nil
 		})
 }
 
