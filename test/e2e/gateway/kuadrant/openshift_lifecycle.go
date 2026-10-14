@@ -21,6 +21,7 @@ package kuadrant
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -70,7 +71,12 @@ func (l *mcpGatewayOLMLifecycle) Setup(ctx context.Context, cfg *envconf.Config)
 		return err
 	}
 
-	return waitForExtensionReady(ctx, r, "mcp-gateway-extension", mcpSystemNamespace, 5*time.Minute)
+	log.Println("waiting for MCPGatewayExtension to become ready...")
+	if err := waitForExtensionReady(ctx, r, "mcp-gateway-extension", mcpSystemNamespace, 5*time.Minute); err != nil {
+		return err
+	}
+	log.Println("setup complete")
+	return nil
 }
 
 func (l *mcpGatewayOLMLifecycle) Teardown(ctx context.Context, cfg *envconf.Config) error {
@@ -89,6 +95,7 @@ func (l *mcpGatewayOLMLifecycle) Teardown(ctx context.Context, cfg *envconf.Conf
 }
 
 func setupOSSM(ctx context.Context, r *resources.Resources) error {
+	log.Println("installing OSSM3 operator...")
 	ossmSub := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "operators.coreos.com/v1alpha1",
 		"kind":       "Subscription",
@@ -108,10 +115,12 @@ func setupOSSM(ctx context.Context, r *resources.Resources) error {
 		return fmt.Errorf("create OSSM Subscription: %w", err)
 	}
 
+	log.Println("waiting for OSSM3 CSV to succeed...")
 	if err := waitForCSVSucceeded(ctx, r, ossmOLMPackage, ossmNamespace, 5*time.Minute); err != nil {
 		return fmt.Errorf("wait for OSSM CSV: %w", err)
 	}
 
+	log.Println("creating IstioCNI and Istio control plane...")
 	istioCNINs := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: istioCNINamespace}}
 	if err := r.Create(ctx, istioCNINs); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create namespace %s: %w", istioCNINamespace, err)
@@ -152,14 +161,17 @@ func setupOSSM(ctx context.Context, r *resources.Resources) error {
 		return fmt.Errorf("create Istio: %w", err)
 	}
 
+	log.Printf("waiting for GatewayClass %s...", openshiftGatewayClass)
 	if err := waitForGatewayClass(ctx, r, openshiftGatewayClass, 5*time.Minute); err != nil {
 		return fmt.Errorf("wait for GatewayClass %s: %w", openshiftGatewayClass, err)
 	}
+	log.Println("OSSM3 ready")
 
 	return nil
 }
 
 func setupMCPGateway(ctx context.Context, r *resources.Resources) error {
+	log.Println("installing mcp-gateway operator via OLM...")
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: mcpSystemNamespace}}
 	if err := r.Create(ctx, ns); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create namespace %s: %w", mcpSystemNamespace, err)
@@ -205,14 +217,17 @@ func setupMCPGateway(ctx context.Context, r *resources.Resources) error {
 		return fmt.Errorf("create Subscription: %w", err)
 	}
 
+	log.Println("waiting for mcp-gateway CSV to succeed...")
 	if err := waitForCSVSucceeded(ctx, r, mcpGatewayOLMPackage, mcpSystemNamespace, 5*time.Minute); err != nil {
 		return fmt.Errorf("wait for CSV: %w", err)
 	}
+	log.Println("mcp-gateway operator ready")
 
 	return nil
 }
 
 func setupGatewayInfrastructure(ctx context.Context, r *resources.Resources) error {
+	log.Println("creating gateway infrastructure...")
 	gwNs := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: gatewayNamespace}}
 	if err := r.Create(ctx, gwNs); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create namespace %s: %w", gatewayNamespace, err)
@@ -316,6 +331,7 @@ func setupGatewayInfrastructure(ctx context.Context, r *resources.Resources) err
 }
 
 func teardownGatewayInfrastructure(ctx context.Context, r *resources.Resources) {
+	log.Println("tearing down gateway infrastructure...")
 	ext := &kuadrantapi.MCPGatewayExtension{
 		ObjectMeta: metav1.ObjectMeta{Name: "mcp-gateway-extension", Namespace: mcpSystemNamespace},
 	}
@@ -339,6 +355,7 @@ func teardownGatewayInfrastructure(ctx context.Context, r *resources.Resources) 
 }
 
 func teardownMCPGateway(ctx context.Context, r *resources.Resources) {
+	log.Println("tearing down mcp-gateway operator...")
 	sub := &unstructured.Unstructured{}
 	sub.SetGroupVersionKind(schema.GroupVersionKind{
 		Group: "operators.coreos.com", Version: "v1alpha1", Kind: "Subscription",
@@ -367,6 +384,7 @@ func teardownMCPGateway(ctx context.Context, r *resources.Resources) {
 }
 
 func teardownOSSM(ctx context.Context, r *resources.Resources) {
+	log.Println("tearing down OSSM3...")
 	istio := &unstructured.Unstructured{}
 	istio.SetGroupVersionKind(schema.GroupVersionKind{
 		Group: "sailoperator.io", Version: "v1", Kind: "Istio",
