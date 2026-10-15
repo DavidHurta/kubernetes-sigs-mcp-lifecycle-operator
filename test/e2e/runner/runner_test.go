@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -496,6 +498,63 @@ printf '%%s' '<testsuites name="gotestsum" tests="0" failures="0" skipped="0" ti
 		if !strings.Contains(logs, exp) {
 			t.Errorf("expected log output to contain %q\ngot: %s", exp, logs)
 		}
+	}
+}
+
+func TestRunGotestsumEnvironment(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		version string
+	}{
+		{name: "unset"},
+		{name: "empty"},
+		{name: "explicit", version: "go1.99.0-custom"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("GOVERSION", tc.version)
+			if tc.name == "unset" {
+				if err := os.Unsetenv("GOVERSION"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("RUNNER_INHERITED", "caller-value")
+			parentEnv := os.Environ()
+			tmpDir := t.TempDir()
+			gotestsumBin := filepath.Join(tmpDir, "gotestsum")
+			script := `#!/bin/sh
+printf '%s\n%s\n' "$GOVERSION" "$RUNNER_INHERITED"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--junitfile" ]; then junit="$2"; shift 2; continue; fi
+  shift
+done
+printf '%s' '<testsuites tests="0"></testsuites>' > "$junit"
+`
+			if err := os.WriteFile(gotestsumBin, []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			var stdout, stderr bytes.Buffer
+			r := runner.New()
+			r.Stdout = &stdout
+			r.Stderr = &stderr
+			r.GotestsumBin = gotestsumBin
+			r.ArtifactsDir = tmpDir
+			r.Packages = []runner.TestPackage{{Name: "e2e", Binary: "/tmp/e2e-tests"}}
+			if result := r.Run(nil); result.ExitCode != 0 {
+				t.Fatalf("expected exit code 0, got %d\nstderr: %s", result.ExitCode, &stderr)
+			}
+
+			wantVersion := tc.version
+			if wantVersion == "" {
+				wantVersion = runtime.Version()
+			}
+			if want := wantVersion + "\ncaller-value\n"; stdout.String() != want {
+				t.Errorf("gotestsum environment output = %q, want %q", stdout.String(), want)
+			}
+			if !slices.Equal(os.Environ(), parentEnv) {
+				t.Error("runner changed the parent environment")
+			}
+		})
 	}
 }
 
