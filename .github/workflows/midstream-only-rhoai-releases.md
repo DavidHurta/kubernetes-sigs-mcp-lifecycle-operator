@@ -77,10 +77,12 @@ YAML or missing/malformed templates abort provisioning.
 Downstream release names matching `rhoai-N.N` or `rhoai-N.N-ea.N` are mirrored
 exactly, except exclusions. Existing target branches are skipped, never reset
 or repaired. Each missing branch starts from **target main**, not downstream
-product code, with branch-specific PR/push filters and release image tags.
-PR revision tags and unrelated YAML are preserved; release branches do not
-publish `odh-stable`. Pushes are non-force and the created remote ref is
-verified. Git/auth/network errors abort the run.
+product code, with only PR filters retargeted to the new branch. Ordinary push
+templates remain main-only. Existing release-push templates handle release
+builds with `{{target_branch}}` image tags, without publishing `odh-stable`.
+All push templates, PR revision tags and unrelated YAML are preserved. Pushes
+are non-force and the created remote ref is verified. Git/auth/network errors
+abort the run.
 
 Before enabling MCPLMO provisioning, supply its templates and apply the same
 three exclusions to its release build triggers. Product source synchronization

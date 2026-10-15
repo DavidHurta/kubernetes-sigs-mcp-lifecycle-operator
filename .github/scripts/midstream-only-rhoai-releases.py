@@ -61,7 +61,7 @@ def expected_images(prefix: str, repository: str) -> dict[str, str]:
 EXPECTED_FILES: Final = expected_files(DEFAULT_MANIFEST_PREFIX)
 REWRITE_FILES: Final = {
     f"{DEFAULT_MANIFEST_PREFIX}-{kind}.yaml"
-    for kind in ("push", "pull-request", "e2e-push", "e2e-pull-request")
+    for kind in ("pull-request", "e2e-pull-request")
 }
 OPERATOR_PUSH_FILE: Final = f"{DEFAULT_MANIFEST_PREFIX}-push.yaml"
 E2E_PUSH_FILE: Final = f"{DEFAULT_MANIFEST_PREFIX}-e2e-push.yaml"
@@ -170,6 +170,7 @@ def validate_and_rewrite(
     file: Path,
     expected_event: str,
     rewrite: bool,
+    release: bool,
     exclusions: list[str],
 ) -> None:
     annotations = annotations_for(document, file)
@@ -186,8 +187,11 @@ def validate_and_rewrite(
         annotations[CEL_ANNOTATION] = normalized.replace(
             MAIN_PREDICATE, f'target_branch == "{branch}"'
         )
-    elif expression != release_predicate(exclusions):
-        fail(f"Unexpected release CEL predicate in {file}")
+    elif release:
+        if expression != release_predicate(exclusions):
+            fail(f"Unexpected release CEL predicate in {file}")
+    elif normalized != f"{expected_event} && {MAIN_PREDICATE}":
+        fail(f"Unexpected main CEL predicate in {file}")
 
 
 def rewrite_tekton_filters(branch: str, tekton_dir: Path) -> None:
@@ -208,11 +212,14 @@ def rewrite_tekton_filters(branch: str, tekton_dir: Path) -> None:
     images = expected_images(prefix, repository)
     files = expected_files(prefix)
     rewrite_files = {
-        f"{prefix}-{kind}.yaml"
-        for kind in ("push", "pull-request", "e2e-push", "e2e-pull-request")
+        f"{prefix}-{kind}.yaml" for kind in ("pull-request", "e2e-pull-request")
     }
     operator_push_file = f"{prefix}-push.yaml"
     e2e_push_file = f"{prefix}-e2e-push.yaml"
+    release_files = {
+        f"{prefix}-release-push.yaml",
+        f"{prefix}-e2e-release-push.yaml",
+    }
     actual_files = {
         file.name
         for pattern in ("*.yaml", "*.yml")
@@ -231,7 +238,13 @@ def rewrite_tekton_filters(branch: str, tekton_dir: Path) -> None:
         yaml, documents = load_yaml_documents(file)
         document = annotated_document(documents, file)
         validate_and_rewrite(
-            document, branch, file, event, filename in rewrite_files, exclusions
+            document,
+            branch,
+            file,
+            event,
+            filename in rewrite_files,
+            filename in release_files,
+            exclusions,
         )
         params = params_for(document, file)
         image_param = named_param(params, "output-image", file)
@@ -239,15 +252,11 @@ def rewrite_tekton_filters(branch: str, tekton_dir: Path) -> None:
         if image_param.get("value") != expected_image:
             fail(f"Expected output image {expected_image!r} in {file}")
         changed = filename in rewrite_files
-        if filename == operator_push_file:
-            image_param["value"] = f"{repository}:{branch}"
-        elif filename == e2e_push_file:
-            image_param["value"] = f"{repository}-e2e:{branch}"
+        if filename == e2e_push_file:
             tags = named_param(params, "additional-tags", file).get("value")
-            if not isinstance(tags, list) or tags != ["odh-stable"]:
+            if tags != ["odh-stable"]:
                 fail(f"Expected exactly the odh-stable additional tag in {file}")
-            named_param(params, "additional-tags", file)["value"] = [branch]
-        if filename == operator_push_file or "release-push" in filename:
+        elif filename == operator_push_file or filename in release_files:
             tags = [param for param in params if param.get("name") == "additional-tags"]
             if len(tags) > 1 or (tags and tags[0].get("value") not in (None, [])):
                 fail(f"Expected no additional tags in {file}")

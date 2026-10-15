@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import copy
 import importlib.util
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -58,6 +59,44 @@ def annotation(file: Path, name: str) -> str:
     return value
 
 
+def push_matches(file: Path, target_branch: str, exclusions: list[str]) -> bool:
+    expression = annotation(file, implementation.CEL_ANNOTATION)
+    if expression == 'event == "push" && target_branch == "main"':
+        return target_branch == "main"
+    assert expression == implementation.release_predicate(exclusions)
+    return (
+        re.fullmatch(r"rhoai-[A-Za-z0-9_][A-Za-z0-9_.-]{0,40}", target_branch)
+        is not None
+        and target_branch not in exclusions
+    )
+
+
+def assert_push_selection(
+    tekton_dir: Path, prefix: str, exclusions: list[str], release_branch: str
+) -> None:
+    for ordinary, release in (
+        (f"{prefix}-push.yaml", f"{prefix}-release-push.yaml"),
+        (f"{prefix}-e2e-push.yaml", f"{prefix}-e2e-release-push.yaml"),
+    ):
+        for branch, expected in ((release_branch, [release]), ("main", [ordinary])):
+            matched = [
+                name
+                for name in (ordinary, release)
+                if push_matches(tekton_dir / name, branch, exclusions)
+            ]
+            assert matched == expected
+    if "rhoai-3.6-ea.2" in exclusions:
+        assert not any(
+            push_matches(tekton_dir / name, "rhoai-3.6-ea.2", exclusions)
+            for name in (
+                f"{prefix}-push.yaml",
+                f"{prefix}-release-push.yaml",
+                f"{prefix}-e2e-push.yaml",
+                f"{prefix}-e2e-release-push.yaml",
+            )
+        )
+
+
 def parameter(file: Path, name: str) -> dict[str, object]:
     document = read_document(file)
     spec = document["spec"]
@@ -71,24 +110,36 @@ def parameter(file: Path, name: str) -> dict[str, object]:
     return matches[0]
 
 
-def test_rewrites_all_four_predicates_and_push_images(tmp_path: Path) -> None:
+def test_rewrites_only_pull_request_predicates(tmp_path: Path) -> None:
     tekton_dir = copy_manifests(tmp_path)
+    push_files = EXPECTED_FILES - implementation.REWRITE_FILES
+    before = {name: (tekton_dir / name).read_bytes() for name in push_files}
 
     implementation.rewrite_tekton_filters(BRANCH, tekton_dir)
 
+    assert implementation.REWRITE_FILES == {
+        "odh-mcp-lifecycle-operator-pull-request.yaml",
+        "odh-mcp-lifecycle-operator-e2e-pull-request.yaml",
+    }
     for filename in implementation.REWRITE_FILES:
         cel = annotation(tekton_dir / filename, implementation.CEL_ANNOTATION)
-        assert f'target_branch == "{BRANCH}"' in cel
-        assert 'target_branch == "main"' not in cel
-    assert parameter(tekton_dir / implementation.OPERATOR_PUSH_FILE, "output-image")[
-        "value"
-    ] == (f"quay.io/opendatahub/odh-mcp-lifecycle-operator:{BRANCH}")
-    assert parameter(tekton_dir / implementation.E2E_PUSH_FILE, "output-image")[
-        "value"
-    ] == (f"quay.io/opendatahub/odh-mcp-lifecycle-operator-e2e:{BRANCH}")
+        assert cel == f'event == "pull_request" && target_branch == "{BRANCH}"'
+    assert all(
+        (tekton_dir / name).read_bytes() == content for name, content in before.items()
+    )
+    assert (
+        parameter(tekton_dir / implementation.OPERATOR_PUSH_FILE, "output-image")[
+            "value"
+        ]
+        == "quay.io/opendatahub/odh-mcp-lifecycle-operator:odh-stable"
+    )
+    assert (
+        parameter(tekton_dir / implementation.E2E_PUSH_FILE, "output-image")["value"]
+        == "quay.io/opendatahub/odh-mcp-lifecycle-operator-e2e:main"
+    )
     assert parameter(tekton_dir / implementation.E2E_PUSH_FILE, "additional-tags")[
         "value"
-    ] == [BRANCH]
+    ] == ["odh-stable"]
 
 
 def test_preserves_unrelated_yaml_semantics_and_documents(tmp_path: Path) -> None:
@@ -125,20 +176,6 @@ def test_preserves_unrelated_yaml_semantics_and_documents(tmp_path: Path) -> Non
         annotations[implementation.CEL_ANNOTATION] = (
             f'{events[filename]} && target_branch == "{BRANCH}"'
         )
-        params = document["spec"]["params"]
-        for param in params:
-            if param["name"] == "output-image" and filename in (
-                implementation.OPERATOR_PUSH_FILE,
-                implementation.E2E_PUSH_FILE,
-            ):
-                param["value"] = (
-                    f"{implementation.DEFAULT_IMAGE_REPOSITORY}{'-e2e' if filename == implementation.E2E_PUSH_FILE else ''}:{BRANCH}"
-                )
-            elif (
-                param["name"] == "additional-tags"
-                and filename == implementation.E2E_PUSH_FILE
-            ):
-                param["value"] = [BRANCH]
 
     implementation.rewrite_tekton_filters(BRANCH, tekton_dir)
 
@@ -148,7 +185,7 @@ def test_preserves_unrelated_yaml_semantics_and_documents(tmp_path: Path) -> Non
     } == expected
 
 
-def test_preserves_release_predicates_and_pr_images_and_tags(tmp_path: Path) -> None:
+def test_preserves_all_push_templates_and_pr_images_and_tags(tmp_path: Path) -> None:
     tekton_dir = copy_manifests(tmp_path)
     unchanged = {
         filename: (tekton_dir / filename).read_bytes()
@@ -189,6 +226,9 @@ def test_preserves_release_predicates_and_pr_images_and_tags(tmp_path: Path) -> 
         tekton_dir / "odh-mcp-lifecycle-operator-e2e-pull-request.yaml",
         "additional-tags",
     )["value"] == ["odh-pr-{{revision}}"]
+    assert_push_selection(
+        tekton_dir, implementation.DEFAULT_MANIFEST_PREFIX, [], BRANCH
+    )
 
 
 @pytest.mark.parametrize("filename", sorted(EXPECTED_FILES))
@@ -326,7 +366,7 @@ def test_release_cel_remains_strict(tmp_path: Path) -> None:
         implementation.rewrite_tekton_filters(BRANCH, tekton_dir)
 
 
-def test_main_cel_normalizes_whitespace(tmp_path: Path) -> None:
+def test_main_cel_normalizes_for_validation_without_rewriting(tmp_path: Path) -> None:
     tekton_dir = copy_manifests(tmp_path)
     file = tekton_dir / implementation.OPERATOR_PUSH_FILE
     file.write_text(
@@ -335,11 +375,10 @@ def test_main_cel_normalizes_whitespace(tmp_path: Path) -> None:
             ' event   == "push"  &&  target_branch == "main" ',
         )
     )
+    original = file.read_bytes()
 
     implementation.rewrite_tekton_filters(BRANCH, tekton_dir)
-    assert annotation(file, implementation.CEL_ANNOTATION) == (
-        f'event == "push" && target_branch == "{BRANCH}"'
-    )
+    assert file.read_bytes() == original
 
 
 @pytest.mark.parametrize(
@@ -476,7 +515,7 @@ def test_empty_configuration_uses_python_defaults_without_github_io(
         parameter(tekton_dir / implementation.OPERATOR_PUSH_FILE, "output-image")[
             "value"
         ]
-        == f"{implementation.DEFAULT_IMAGE_REPOSITORY}:{BRANCH}"
+        == f"{implementation.DEFAULT_IMAGE_REPOSITORY}:odh-stable"
     )
     assert implementation.configured_exclusions() == []
 
@@ -574,6 +613,7 @@ def test_rewrites_renamed_manifest_and_image_configuration(
     prefix = "odh-mcp-lifecycle-module-operator"
     repository = "quay.io/opendatahub/odh-mcp-lifecycle-module-operator"
     exclusions = ["rhoai-3.6-ea.2", "rhoai-3.5", "rhoai-3.6-ea.1"]
+    release_branch = "rhoai-3.7"
     for file in tuple(tekton_dir.glob("*.yaml")):
         renamed = file.name.replace("odh-mcp-lifecycle-operator", prefix)
         content = file.read_text().replace(
@@ -593,26 +633,38 @@ def test_rewrites_renamed_manifest_and_image_configuration(
         tekton_dir / f"{prefix}-release-push.yaml",
         tekton_dir / f"{prefix}-e2e-release-push.yaml",
     ]
-    release_bytes = {file: file.read_bytes() for file in release_files}
+    push_files = [
+        tekton_dir / f"{prefix}-push.yaml",
+        tekton_dir / f"{prefix}-e2e-push.yaml",
+        *release_files,
+    ]
+    push_bytes = {file: file.read_bytes() for file in push_files}
 
-    implementation.rewrite_tekton_filters(BRANCH, tekton_dir)
+    implementation.rewrite_tekton_filters(release_branch, tekton_dir)
 
+    assert all(file.read_bytes() == content for file, content in push_bytes.items())
     assert parameter(tekton_dir / f"{prefix}-push.yaml", "output-image")["value"] == (
-        f"{repository}:{BRANCH}"
+        f"{repository}:odh-stable"
     )
     assert (
         parameter(tekton_dir / f"{prefix}-e2e-push.yaml", "output-image")["value"]
-        == f"{repository}-e2e:{BRANCH}"
+        == f"{repository}-e2e:main"
     )
     assert parameter(tekton_dir / f"{prefix}-pull-request.yaml", "additional-tags")[
         "value"
     ] == ["odh-pr-{{revision}}"]
-    assert all(file.read_bytes() == content for file, content in release_bytes.items())
     assert all(
         annotation(file, implementation.CEL_ANNOTATION)
         == implementation.release_predicate(exclusions)
         for file in release_files
     )
+    assert (
+        annotation(
+            tekton_dir / f"{prefix}-pull-request.yaml", implementation.CEL_ANNOTATION
+        )
+        == f'event == "pull_request" && target_branch == "{release_branch}"'
+    )
+    assert_push_selection(tekton_dir, prefix, exclusions, release_branch)
 
 
 @pytest.mark.parametrize(
@@ -839,7 +891,7 @@ def test_main_selects_exact_exclusions_and_commits_target_main(
     ).strip()
     target_refs = {"rhoai-3.8-ea.2"}
     pushed: list[str] = []
-    committed: dict[str, tuple[str, str, dict[str, str]]] = {}
+    committed: dict[str, tuple[str, str, dict[str, str], list[str]]] = {}
     pushed_shas: dict[str, str] = {}
     branches = (
         "rhoai-3.4",
@@ -890,9 +942,18 @@ def test_main_selects_exact_exclusions_and_commits_target_main(
                 filename: real_git(
                     "show", f"HEAD:.tekton/{filename}", cwd=cwd, capture_output=True
                 )
-                for filename in implementation.REWRITE_FILES
+                for filename in EXPECTED_FILES
             }
-            committed[branch] = (commit, parent, manifests)
+            changed_files = real_git(
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                "HEAD",
+                cwd=cwd,
+                capture_output=True,
+            ).splitlines()
+            committed[branch] = (commit, parent, manifests, changed_files)
             pushed_shas[branch] = commit
             target_refs.add(branch)
             return ""
@@ -903,18 +964,20 @@ def test_main_selects_exact_exclusions_and_commits_target_main(
 
     assert pushed == ["rhoai-3.4", "rhoai-3.7", "rhoai-4.0"]
     assert set(committed) == set(pushed)
-    for branch, (_, parent, manifests) in committed.items():
+    for branch, (_, parent, manifests, changed_files) in committed.items():
         assert parent == target_main
-        for filename, content in manifests.items():
-            assert f'target_branch == "{branch}"' in content
-        assert (
-            f"quay.io/opendatahub/odh-mcp-lifecycle-operator:{branch}"
-            in manifests[implementation.OPERATOR_PUSH_FILE]
+        assert changed_files == sorted(
+            f".tekton/{filename}" for filename in implementation.REWRITE_FILES
         )
-        assert (
-            f"quay.io/opendatahub/odh-mcp-lifecycle-operator-e2e:{branch}"
-            in manifests[implementation.E2E_PUSH_FILE]
-        )
+        for filename in implementation.REWRITE_FILES:
+            assert f'target_branch == "{branch}"' in manifests[filename]
+        for filename in EXPECTED_FILES - implementation.REWRITE_FILES:
+            assert manifests[filename] == real_git(
+                "show",
+                f"{parent}:.tekton/{filename}",
+                cwd=checkout,
+                capture_output=True,
+            )
     assert not list(checkout.glob(".git/worktrees/*"))
     assert "extraheader" not in (checkout / ".git/config").read_text()
     assert (
