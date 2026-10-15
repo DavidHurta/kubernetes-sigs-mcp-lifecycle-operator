@@ -113,7 +113,7 @@ printf '%%s' %q > "$junit"
 	return result, suites, string(invocation)
 }
 
-func TestRunnerIdentityDefaultsToMCPLO(t *testing.T) {
+func TestRunnerIdentityDefaultsToOperator(t *testing.T) {
 	result, suites, invocation := runJUnitReportWithIdentity(t, "", "")
 	if result.ExitCode != 0 {
 		t.Fatalf("expected fake gotestsum to succeed, got %d", result.ExitCode)
@@ -125,8 +125,8 @@ func TestRunnerIdentityDefaultsToMCPLO(t *testing.T) {
 	for _, property := range suites.Properties {
 		properties[property.Name] = property.Value
 	}
-	if properties["repo"] != "mcplo" {
-		t.Fatalf("expected default derived repo abbreviation, got %q", properties["repo"])
+	if properties["repo"] != "operator" {
+		t.Fatalf("expected default repo abbreviation, got %q", properties["repo"])
 	}
 	if !strings.Contains(invocation, "--junitfile-project-name mcp-lifecycle-operator") {
 		t.Fatalf("expected gotestsum project name from default component, got %q", invocation)
@@ -134,21 +134,21 @@ func TestRunnerIdentityDefaultsToMCPLO(t *testing.T) {
 }
 
 func TestRunnerIdentityUsesCodeConfigurationAndDerivedRepoAbbreviation(t *testing.T) {
-	result, suites, invocation := runJUnitReportWithIdentity(t, "custom-component", "")
+	result, suites, invocation := runJUnitReportWithIdentity(t, "mcp-lifecycle-dev-console", "")
 	if result.ExitCode != 0 {
 		t.Fatalf("expected fake gotestsum to succeed, got %d", result.ExitCode)
 	}
-	if suites.Name != "custom-component" {
+	if suites.Name != "mcp-lifecycle-dev-console" {
 		t.Fatalf("expected code-configured component, got %q", suites.Name)
 	}
 	properties := map[string]string{}
 	for _, property := range suites.Properties {
 		properties[property.Name] = property.Value
 	}
-	if properties["repo"] != "customc" {
+	if properties["repo"] != "mcpldc" {
 		t.Fatalf("expected repo abbreviation derived from component, got %q", properties["repo"])
 	}
-	if !strings.Contains(invocation, "--junitfile-project-name custom-component") {
+	if !strings.Contains(invocation, "--junitfile-project-name mcp-lifecycle-dev-console") {
 		t.Fatalf("expected gotestsum project name from component, got %q", invocation)
 	}
 }
@@ -193,7 +193,7 @@ func assertJUnitSemantics(t *testing.T, suites junitSuites, rhoai bool) {
 	t.Helper()
 	assertJUnitRootCounters(t, suites)
 	if rhoai {
-		assertRhoAIJUnitSemantics(t, suites)
+		assertRhoAIJUnitSemantics(t, suites, "Mcplo")
 		return
 	}
 	assertVerbatimJUnitSemantics(t, suites)
@@ -206,7 +206,7 @@ func assertJUnitRootCounters(t *testing.T, suites junitSuites) {
 	}
 }
 
-func assertRhoAIJUnitSemantics(t *testing.T, suites junitSuites) {
+func assertRhoAIJUnitSemantics(t *testing.T, suites junitSuites, classname string) {
 	t.Helper()
 	if suites.Name != "mcp-lifecycle-operator" || len(suites.Suites) != 1 || suites.Suites[0].Name != "Mcp Lifecycle Operator" {
 		t.Fatalf("unexpected rhoai root/suite: %+v", suites)
@@ -216,7 +216,7 @@ func assertRhoAIJUnitSemantics(t *testing.T, suites junitSuites) {
 		t.Fatalf("unexpected rhoai suite counters: %+v", suite)
 	}
 	for _, caseResult := range suite.Cases {
-		if caseResult.Classname != "Mcplo" || caseResult.Time <= 0 {
+		if caseResult.Classname != classname || caseResult.Time <= 0 {
 			t.Errorf("case identity/timing not rewritten: %+v", caseResult)
 		}
 	}
@@ -322,7 +322,8 @@ func TestJUnitReportDefaultsRepoAbbr(t *testing.T) {
 	if result.ExitCode != 0 {
 		t.Fatalf("expected default repoabbr to succeed, got %d", result.ExitCode)
 	}
-	assertJUnitSemantics(t, suites, true)
+	assertJUnitRootCounters(t, suites)
+	assertRhoAIJUnitSemantics(t, suites, "Operator")
 }
 
 func TestJUnitReportEnvironmentOverridesReportMode(t *testing.T) {
