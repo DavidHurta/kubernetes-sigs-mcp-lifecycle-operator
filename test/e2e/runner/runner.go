@@ -258,6 +258,9 @@ func (r *Runner) orchestrate(args []string) Result {
 }
 
 func deriveRepoAbbr(component string) string {
+	if component == defaultComponent {
+		return "operator"
+	}
 	parts := strings.Split(component, "-")
 	var abbreviation strings.Builder
 	abbreviation.WriteString(parts[0])
